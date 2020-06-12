@@ -82,7 +82,8 @@ type local struct {
 }
 
 const (
-	daxCheckBinary = "_work/pmem-dax-check"
+	daxCheckBinary        = "_work/pmem-dax-check"
+	accessHugepagesBinary = "_work/pmem-access-hugepages"
 )
 
 func (p *daxTestSuite) DefineTests(driver testsuites.TestDriver, pattern testpatterns.TestPattern) {
@@ -102,6 +103,16 @@ func (p *daxTestSuite) DefineTests(driver testsuites.TestDriver, pattern testpat
 		By("Compiling with: " + strings.Join(build.Args, " "))
 		err := build.Run()
 		framework.ExpectNoError(err, "compile ./test/cmd/pmem-dax-check")
+
+		// Build pmem-hugepages-check helper binary.
+		l.root = os.Getenv("REPO_ROOT")
+		build = exec.Command("/bin/sh", "-c", os.Getenv("GO")+" build -o "+accessHugepagesBinary+" ./test/cmd/pmem-access-hugepages")
+		build.Stdout = GinkgoWriter
+		build.Stderr = GinkgoWriter
+		build.Dir = l.root
+		By("Compiling with: " + strings.Join(build.Args, " "))
+		err = build.Run()
+		framework.ExpectNoError(err, "compile ./test/cmd/pmem-hugepages-check")
 
 		// Now do the more expensive test initialization.
 		l.config, l.testCleanup = driver.PrepareTest(f)
@@ -305,7 +316,7 @@ func testDax(
 	if volumeMode == v1.PersistentVolumeBlock {
 		By("mounting raw block device")
 		// TODO: remove the workaround above and script invocation here.
-		pmempod.RunInPod(f, root, nil, "/data/create-dax-dev.sh && mkfs.ext4 -b 4096 /dax-dev && mkdir -p /mnt && mount -odax /dax-dev /mnt", ns, pod.Name, containerName)
+		pmempod.RunInPod(f, root, nil, "/data/create-dax-dev.sh && mkfs.ext4 -b 4096 -E stride=512,stripe_width=512 /dax-dev && mkdir -p /mnt && mount -odax /dax-dev /mnt", ns, pod.Name, containerName)
 	}
 
 	By("checking that missing DAX support is detected")
@@ -314,6 +325,46 @@ func testDax(
 	By("checking volume for DAX support")
 	pmempod.RunInPod(f, root, []string{daxCheckBinary}, "lsblk; mount | grep /mnt; "+daxCheckBinary+" /mnt/daxtest", ns, pod.Name, containerName)
 
+	By("starting pmem-dax-paging-monitor in host")
+	// run trace monitor on all workers
+	for worker := 1; ; worker++ {
+		sshcmd := fmt.Sprintf("%s/_work/%s/ssh.%d", os.Getenv("REPO_ROOT"), os.Getenv("CLUSTER"), worker)
+		ssh := exec.Command(sshcmd, "sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/events/fs_dax/dax_pmd_fault_done/enable; echo 1 > /sys/kernel/debug/tracing/tracing_on; cat /sys/kernel/debug/tracing/trace_pipe > /tmp/tracetmp 2>&1 &'")
+		_, err := ssh.Output()
+		if err != nil && os.IsNotExist(err) {
+			break
+		}
+		//By(fmt.Sprintf("Output1 from worker %d:[%s]", worker, out))
+	}
+
+	By("running pmem-access-hugepages in pod")
+	outp, _ := pmempod.RunInPod(f, root, []string{accessHugepagesBinary}, accessHugepagesBinary+"; hostname", ns, pod.Name, containerName)
+	By(fmt.Sprintf("Output2 from memmap pod:[%s]", outp))
+	// parse from access program output where was it running, then show trace output from that node only
+
+	By("show pmem-dax-paging-monitor output in host")
+	for worker := 1; ; worker++ {
+		sshcmd := fmt.Sprintf("%s/_work/%s/ssh.%d", os.Getenv("REPO_ROOT"), os.Getenv("CLUSTER"), worker)
+		ssh := exec.Command(sshcmd, "cat /tmp/tracetmp|awk '{print $9 $13}'")
+		out, err := ssh.Output()
+		if err != nil && os.IsNotExist(err) {
+			// if we are here, no worker node had tracer output
+			By("PROBLEM: no worker has tracer output, break loop")
+			break
+		}
+		By(fmt.Sprintf("Output3 from worker %d:[%s]", worker, out))
+		if len(out) > 0 { // there was output from trace, get fault type
+			ssh := exec.Command(sshcmd, "cat /tmp/tracetmp|awk '{print $22}'")
+			faultType, _ := ssh.Output()
+			By(fmt.Sprintf("Worker %d has tracer output, fault type:[%s]", worker, faultType))
+			ssh = exec.Command(sshcmd, "cat /tmp/tracetmp")
+			tracetmp, _ := ssh.Output()
+			By(fmt.Sprintf("Worker %d tracetmp is:[%s]", worker, tracetmp))
+			framework.ExpectEqual(strings.TrimSpace(string(faultType)), "NOPAGE", "page fault type has to be NOPAGE")
+			framework.ExpectEqual(outp, out, "mapped addr and inode must match")
+			break
+		}
+	}
 	// Data written in a container running under Kata Containers
 	// should be visible also in a normal container, unless the
 	// volume itself is ephemeral of course.  We currently don't
